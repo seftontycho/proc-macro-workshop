@@ -1,44 +1,157 @@
 use proc_macro2::Ident;
 use quote::{format_ident, quote};
 use syn::{
-    AngleBracketedGenericArguments, Data, DeriveInput, Fields, GenericArgument, PathArguments,
-    Type, TypePath,
+    AngleBracketedGenericArguments, Data, DeriveInput, Fields, GenericArgument, MetaList,
+    PathArguments, Type, TypePath,
 };
 
-fn parse_field_type(ty: Type) -> (Type, bool) {
-    let type_path = match ty.clone() {
-        Type::Path(type_path) => type_path,
-        _ => return (ty, false),
-    };
+enum Field {
+    Required(Ident, Type),
+    Optional(Ident, Type),
+    Repeated(Ident, Type, Ident),
+    Error(syn::Error),
+}
 
-    let path = match type_path {
-        TypePath { qself: None, path } => path,
-        _ => return (ty, false),
+fn extract_contained_type<'a>(ty: &'a Type, container: &str) -> Option<&'a Type> {
+    let path = match ty {
+        Type::Path(TypePath {
+            qself: None,
+            ref path,
+        }) => path,
+        _ => return None,
     };
 
     let segment = match path.segments.first() {
         Some(segment) => segment,
-        None => return (ty, false),
+        None => return None,
     };
 
-    if segment.ident != "Option" {
-        return (ty, false);
+    if segment.ident != container {
+        return None;
     }
 
-    let args = match &segment.arguments {
-        PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => args,
-        _ => unreachable!(),
+    let args = match segment.arguments {
+        PathArguments::AngleBracketed(AngleBracketedGenericArguments { ref args, .. }) => args,
+        _ => return None,
     };
 
-    let contained_type = match args.first() {
-        Some(GenericArgument::Type(ty)) => ty,
-        _ => unreachable!(),
-    };
-
-    (contained_type.clone(), true)
+    match args.first() {
+        Some(GenericArgument::Type(ty)) => Some(ty),
+        _ => None,
+    }
 }
 
-fn parse_fields(data: Data) -> Option<(Vec<Ident>, Vec<Type>, Vec<bool>)> {
+fn parse_repeated_field(field: &syn::Field) -> Result<Option<Field>, syn::Error> {
+    let attrs = &field.attrs;
+    let attr = match attrs.first() {
+        Some(attr) => attr,
+        None => return Ok(None),
+    };
+
+    if !attr.path().is_ident("builder") {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "expected `builder` attribute",
+        ));
+    };
+
+    let tokens = match attr.meta {
+        syn::Meta::List(MetaList { ref tokens, .. }) => tokens,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected `builder` attribute",
+            ))
+        }
+    };
+
+    let mut tokens = tokens.clone().into_iter();
+
+    match tokens.next() {
+        Some(proc_macro2::TokenTree::Ident(ident)) => {
+            if ident != "each" {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "expected `builder(each = \"...\")`",
+                ));
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected `builder(each = \"...\")`",
+            ))
+        }
+    };
+
+    match tokens.next() {
+        Some(proc_macro2::TokenTree::Punct(punct)) => {
+            if punct.as_char() != '=' {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "expected `builder(each = \"...\")`",
+                ));
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected `builder(each = \"...\")`",
+            ))
+        }
+    };
+
+    println!("matched =");
+
+    let literal = match tokens.next() {
+        Some(proc_macro2::TokenTree::Literal(literal)) => literal,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected `builder(each = \"...\")`",
+            ))
+        }
+    };
+
+    let each = literal.to_string();
+    let each = format_ident!("{}", each.trim_matches('"'));
+
+    let contained_type = match extract_contained_type(&field.ty, "Vec") {
+        Some(ty) => ty,
+        None => return Err(syn::Error::new_spanned(attr, "expected type of `Vec<...>")),
+    };
+
+    Ok(Some(Field::Repeated(
+        field.ident.clone().unwrap(),
+        contained_type.clone(),
+        each,
+    )))
+}
+
+fn parse_optional_field(field: &syn::Field) -> Option<Field> {
+    let contained_type = extract_contained_type(&field.ty, "Option")?;
+
+    Some(Field::Optional(
+        field.ident.clone().unwrap(),
+        contained_type.clone(),
+    ))
+}
+
+fn parse_field(field: &syn::Field) -> Field {
+    if let Some(field) = parse_optional_field(field) {
+        return field;
+    };
+
+    match parse_repeated_field(field) {
+        Ok(Some(field)) => return field,
+        Err(err) => return Field::Error(err),
+        _ => {}
+    }
+
+    Field::Required(field.ident.clone().unwrap(), field.ty.clone())
+}
+
+fn parse_fields(data: Data) -> Option<Vec<Field>> {
     let data = match data {
         Data::Struct(data) => data,
         _ => return None,
@@ -49,84 +162,173 @@ fn parse_fields(data: Data) -> Option<(Vec<Ident>, Vec<Type>, Vec<bool>)> {
         _ => return None,
     };
 
-    let mut names = Vec::new();
-    let mut types = Vec::new();
-    let mut required = Vec::new();
+    Some(
+        named
+            .pairs()
+            .map(|pair| parse_field(pair.value()))
+            .collect(),
+    )
+}
 
-    for pair in named.pairs() {
-        let value = pair.value();
-        let name = value.ident.clone().unwrap();
-        let (ty, optional) = parse_field_type(value.ty.clone());
+fn generate_setters(fields: &[Field]) -> Vec<proc_macro2::TokenStream> {
+    let mut field_setters = Vec::new();
 
-        names.push(name.clone());
-        types.push(ty);
-        required.push(!optional)
+    for field in fields.iter() {
+        if let Field::Repeated(name, ty, each) = field {
+            field_setters.push(quote!(
+                pub fn #each(&mut self, #each: #ty) -> &mut Self {
+                    self.#name.push(#each);
+                    self
+                }
+            ));
+
+            if each != name {
+                field_setters.push(quote!(
+                    pub fn #name(&mut self, #name: std::vec::Vec<#ty>) -> &mut Self {
+                        self.#name = #name;
+                        self
+                    }
+                ));
+            }
+
+            continue;
+        }
+
+        let (name, ty) = match field {
+            Field::Required(name, ty) => (name, ty),
+            Field::Optional(name, ty) => (name, ty),
+            _ => unreachable!(),
+        };
+
+        field_setters.push(quote!(
+            pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                self.#name = Some(#name);
+                self
+            }
+        ));
     }
 
-    Some((names, types, required))
+    field_setters
+}
+
+fn generate_build_checks(fields: &[Field]) -> impl Iterator<Item = proc_macro2::TokenStream> + '_ {
+    fields.iter().filter_map(|field| {
+        let name = match field {
+            Field::Required(name, _) => name,
+            _ => return None,
+        };
+
+        let err_msg = format!("{} is required", name);
+
+        Some(quote!(
+            let #name = self.#name.clone().ok_or(#err_msg)?;
+        ))
+    })
+}
+
+fn generate_populated_fields(
+    fields: &[Field],
+) -> impl Iterator<Item = proc_macro2::TokenStream> + '_ {
+    fields.iter().map(|field| {
+        if let Field::Required(name, _) = field {
+            return quote!(#name: self.#name.clone().unwrap());
+        }
+
+        let name = match field {
+            Field::Optional(name, _) => name,
+            Field::Repeated(name, _, _) => name,
+            _ => unreachable!(),
+        };
+
+        quote!(#name: self.#name.clone())
+    })
+}
+
+fn generate_build_method(struct_name: &Ident, fields: &[Field]) -> proc_macro2::TokenStream {
+    let build_checks = generate_build_checks(fields);
+    let populated_fields = generate_populated_fields(fields);
+
+    let build_method = quote!(
+        pub fn build(&self) -> std::result::Result<#struct_name, std::boxed::Box<dyn std::error::Error>> {
+            #(#build_checks)*
+
+            std::result::Result::Ok(#struct_name {
+                #(#populated_fields),*
+            })
+        }
+    );
+
+    build_method
+}
+
+fn generate_builder_definition(builder_name: &Ident, fields: &[Field]) -> proc_macro2::TokenStream {
+    let builder_fields = fields.iter().map(|field| match field {
+        Field::Required(name, ty) => quote!(#name: std::option::Option<#ty>),
+        Field::Optional(name, ty) => quote!(#name: std::option::Option<#ty>),
+        Field::Repeated(name, ty, _) => quote!(#name: Vec<#ty>),
+        _ => unreachable!(),
+    });
+
+    quote!(
+        pub struct #builder_name {
+            #(#builder_fields),*
+        }
+    )
+}
+
+fn generate_builder_method(
+    struct_name: &Ident,
+    builder_name: &Ident,
+    fields: &[Field],
+) -> proc_macro2::TokenStream {
+    let builder_defaults = fields.iter().map(|field| match field {
+        Field::Required(name, _) => quote!(#name: std::option::Option::None),
+        Field::Optional(name, _) => quote!(#name: std::option::Option::None),
+        Field::Repeated(name, _, _) => quote!(#name: std::vec::Vec::new()),
+        _ => unreachable!(),
+    });
+
+    quote!(
+        impl #struct_name {
+            pub fn builder() -> #builder_name {
+                #builder_name {
+                    #(#builder_defaults),*
+                }
+            }
+        }
+    )
 }
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let parsed = syn::parse_macro_input!(input as DeriveInput);
-    let (field_names, field_types, required) = parse_fields(parsed.data).unwrap();
-    let name = parsed.ident;
 
-    let builder_name = format_ident!("{}Builder", name);
+    let fields = parse_fields(parsed.data).unwrap();
+    let struct_name = parsed.ident;
+    let builder_name = format_ident!("{}Builder", struct_name);
 
-    let builder_func = quote! {
-        impl #name {
-            pub fn builder() -> #builder_name {
-                #builder_name {
-                    #(#field_names: None),*
-                }
-            }
+    for field in fields.iter() {
+        if let Field::Error(err) = field {
+            return err.to_compile_error().into();
         }
-    };
-
-    let builder_struct = quote!(
-    pub struct #builder_name {
-        #(#field_names: Option<#field_types>),*
-    });
-
-    let mut non_optional_fields = Vec::new();
-    let mut populated_fields = Vec::new();
-
-    for (field_name, is_required) in field_names.iter().zip(required) {
-        if is_required {
-            non_optional_fields.push(field_name);
-            populated_fields.push(quote!(#field_name: self.#field_name.clone().unwrap()));
-            continue;
-        };
-
-        populated_fields.push(quote!(#field_name: self.#field_name.clone()));
     }
 
-    let builder_impl = quote!(
-        impl #builder_name {
-            pub fn build(&self) -> Result<#name, Box<dyn std::error::Error>> {
-                match (#(&self.#non_optional_fields),*) {
-                    (#(Some(#non_optional_fields)),*) => {
-                        Ok(#name {
-                            #(#populated_fields),*
-                        })
-                    },
-                    _ => Err("Not all fields initialised".into()),
-                }
-            }
+    let builder_method = generate_builder_method(&struct_name, &builder_name, &fields);
+    let builder_definition = generate_builder_definition(&builder_name, &fields);
+    let build_method = generate_build_method(&struct_name, &fields);
+    let field_setters = generate_setters(&fields);
 
-            #(pub fn #field_names(&mut self, #field_names: #field_types) -> &mut Self {
-                self.#field_names = Some(#field_names);
-                self
-            })
-            *
+    let expanded = quote!(
+        #builder_method
+
+        #builder_definition
+
+        impl #builder_name {
+            #build_method
+
+            #(#field_setters)*
         }
     );
 
-    quote!(
-        #builder_func
-        #builder_struct
-        #builder_impl
-    )
-    .into()
+    expanded.into()
 }
